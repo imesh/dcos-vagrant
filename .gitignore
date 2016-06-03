@@ -5,6 +5,8 @@ exhibitor.properties
 dcos
 provision/jre-*-linux-x64.tgz
 
+docker/images/*
+*.vdi
 dcos_generate_config*.sh
 /etc/config.yaml
 /VagrantConfig.yaml

@@ -3,12 +3,8 @@
 
 require_relative 'gen_conf_config'
 require_relative 'executor'
-require_relative 'errors'
 require 'thread'
 require 'yaml'
-require 'uri'
-require 'open-uri'
-require 'time'
 
 module VagrantPlugins
   module DCOS
@@ -22,6 +18,7 @@ module VagrantPlugins
           @config.config_template_path,
           @config.install_method.to_sym,
           @config.max_install_threads,
+          @config.postflight_timeout_seconds
         )
       end
 
@@ -51,7 +48,7 @@ module VagrantPlugins
         remote_sudo(@machine, command)
       end
 
-      def install(machine_types, config_template_path, install_method, max_install_threads)
+      def install(machine_types, config_template_path, install_method, max_install_threads, postflight_timeout_seconds)
         @machine.ui.info "Reading #{config_template_path}"
         gen_conf_config = GenConfConfigLoader.load_file(config_template_path)
 
@@ -72,7 +69,7 @@ module VagrantPlugins
         boot_address = find_address(@machine)
         gen_conf_config.exhibitor_zk_hosts = "#{boot_address}:2181"
         case install_method
-        when :ssh_push, :web
+        when :ssh_push
           # TODO: in the future this may not be required by genconf, since it's really an internal concern
           gen_conf_config.bootstrap_url = 'file:///opt/dcos_install_tmp'
         when :ssh_pull
@@ -85,8 +82,7 @@ module VagrantPlugins
         when :aws
           gen_conf_config.resolvers = ['169.254.169.253']
         else # :virtualbox
-          # default to VirtualBox's NAT DNS Host Resolver
-          gen_conf_config.resolvers ||= ['10.0.2.3']
+          gen_conf_config.resolvers ||= ['8.8.8.8']
         end
 
         @machine.ui.success 'Generating Configuration: ~/dcos/genconf/config.yaml'
@@ -98,24 +94,7 @@ module VagrantPlugins
 
         @machine.ui.success 'Importing Private SSH Key: ~/dcos/genconf/ssh_key'
         sudo('cp /vagrant/.vagrant/dcos/private_key_vagrant ~/dcos/genconf/ssh_key')
-
-        if install_method == :web
-          # Move config files to the /vagrant mount so the user can reference/upload them to the web ui
-          sudo('mkdir -p /vagrant/dcos')
-          sudo('mv ~/dcos/genconf/config.yaml /vagrant/dcos/config.yaml')
-          sudo('mv ~/dcos/genconf/ip-detect /vagrant/dcos/ip-detect')
-          start_web_installer
-          installer_address = "http://#{@machine.config.vm.hostname}:9000"
-          unless probe_address(installer_address)
-            @machine.ui.error 'Timed out waiting for the Web Installer to start'
-            sudo('systemctl status dcos-installer')
-            raise InstallError.new('Timed out waiting for the Web Installer to start')
-          end
-          @machine.ui.success "DC/OS Web Installer Available: #{installer_address}"
-          @machine.ui.success "Example config: dcos/config.yaml"
-          @machine.ui.success "Example ip-detect: dcos/ip-detect"
-          return
-        end
+        # sudo('cat ~/dcos/genconf/ssh_key')
 
         @machine.ui.success 'Generating DC/OS Installer Files: ~/dcos/genconf/serve/'
         sudo('cd ~/dcos && bash ~/dcos/dcos_generate_config.sh --genconf && cp -rpv ~/dcos/genconf/serve/* /var/tmp/dcos/')
@@ -124,7 +103,7 @@ module VagrantPlugins
         when :ssh_push
           install_push
         when :ssh_pull
-          install_pull(active_machines, machine_types, max_install_threads)
+          install_pull(active_machines, machine_types, max_install_threads, postflight_timeout_seconds)
         end
 
         @machine.ui.success "DC/OS Installation Complete\nWeb Interface: http://m1.dcos/"
@@ -134,74 +113,13 @@ module VagrantPlugins
         active_machines.select { |name, _provider| machine_types[name.to_s]['type'] == type }
       end
 
-      def start_web_installer
-        service_start_path = '/usr/local/bin/dcos-installer'
-        service_start = <<-EOF
-#!/usr/bin/env bash
-cd /root/dcos
-exec bash /root/dcos/dcos_generate_config.sh --web
-EOF
-
-        escaped_service_start = service_start.gsub('$', '\$')
-
-        @machine.ui.success "Generating Installer Script: #{service_start_path}"
-        sudo(%(cat << EOF > #{service_start_path}\n#{escaped_service_start}\nEOF))
-        sudo("chmod u+x #{service_start_path}")
-
-        service_config_path = '/etc/systemd/system/dcos-installer.service'
-        service_config = <<-EOF
-[Unit]
-Description=DC/OS Web Installer
-After=docker.service
-Requires=docker.service
-
-[Service]
-Type=simple
-ExecStart=#{service_start_path}
-KillMode=process
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-        escaped_service_config = service_config.gsub('$', '\$')
-
-        @machine.ui.success "Generating Installer Service: #{service_config_path}"
-        sudo(%(cat << EOF > #{service_config_path}\n#{escaped_service_config}\nEOF))
-        sudo('systemctl daemon-reload && systemctl enable dcos-installer')
-
-        @machine.ui.success "Starting Installer Service"
-        sudo('systemctl start dcos-installer')
-      end
-
-      def probe_address(address)
-        # 2 minute timeout
-        timeout = Time.now + (60 * 2)
-
-        until Time.now > timeout do
-          machine.ui.output("Probing #{address} ...")
-          begin
-            open(address) do |file|
-              # ignore response
-            end
-            return true
-          rescue OpenURI::HTTPError, Errno::ECONNREFUSED => error
-            sleep(5)
-          end
-        end
-
-        # timeout exceeded
-        return false
-      end
-
       def install_push
         sudo('cd ~/dcos && bash ~/dcos/dcos_generate_config.sh --preflight')
         sudo('cd ~/dcos && bash ~/dcos/dcos_generate_config.sh --deploy')
         sudo('cd ~/dcos && bash ~/dcos/dcos_generate_config.sh --postflight')
       end
 
-      def install_pull(active_machines, machine_types, max_install_threads)
+      def install_pull(active_machines, machine_types, max_install_threads, postflight_timeout_seconds)
         # install masters in parallel
         queue = Queue.new
         filter_machines(active_machines, machine_types, 'master').each do |name, provider|
@@ -232,41 +150,29 @@ EOF
         Executor.exec(queue, max_install_threads)
 
         # postflight all nodes in parallel
-        # reconfigure agent memory after postflight
         queue = Queue.new
         filter_machines(active_machines, machine_types, 'master').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
             machine.ui.success 'DC/OS Postflight'
-            remote_sudo(machine, 'dcos-postflight')
+            write_postflight(machine, postflight_timeout_seconds)
+            remote_sudo(machine, '/opt/mesosphere/bin/postflight.sh')
           end)
         end
         filter_machines(active_machines, machine_types, 'agent-private').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
             machine.ui.success 'DC/OS Postflight'
-            remote_sudo(machine, 'dcos-postflight')
-            if machine_types[name.to_s]['memory-reserved']
-              memory = machine_types[name.to_s]['memory'] - machine_types[name.to_s]['memory-reserved']
-              machine.ui.success "Setting Mesos Memory: #{memory} (role=*)"
-              remote_sudo(machine, %(mesos-memory #{memory}))
-              machine.ui.success 'Restarting Mesos Agent'
-              remote_sudo(machine, %(bash -c "systemctl stop dcos-mesos-slave.service && rm -f /var/lib/mesos/slave/meta/slaves/latest && systemctl start dcos-mesos-slave.service --no-block"))
-            end
+            write_postflight(machine, postflight_timeout_seconds)
+            remote_sudo(machine, '/opt/mesosphere/bin/postflight.sh')
           end)
         end
         filter_machines(active_machines, machine_types, 'agent-public').each do |name, provider|
           machine = @machine.env.machine(name, provider)
           queue.push(Proc.new do
             machine.ui.success 'DC/OS Postflight'
-            remote_sudo(machine, 'dcos-postflight')
-            if machine_types[name.to_s]['memory-reserved']
-              memory = machine_types[name.to_s]['memory'] - machine_types[name.to_s]['memory-reserved']
-              machine.ui.success "Setting Mesos Memory: #{memory} (role=slave_public)"
-              remote_sudo(machine, %(mesos-memory #{memory} slave_public))
-              machine.ui.success 'Restarting Mesos Agent'
-              remote_sudo(machine, %(bash -c "systemctl stop dcos-mesos-slave-public.service && rm -f /var/lib/mesos/slave/meta/slaves/latest && systemctl start dcos-mesos-slave-public.service --no-block"))
-            end
+            write_postflight(machine, postflight_timeout_seconds)
+            remote_sudo(machine, '/opt/mesosphere/bin/postflight.sh')
           end)
         end
         Executor.exec(queue, max_install_threads)
@@ -297,7 +203,45 @@ set -o pipefail
 echo $(/usr/sbin/ip route show to match #{master_ip} | grep -Eo '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' | tail -1)
 EOF
 
-        sudo(%(cat << 'EOF' > ~/dcos/genconf/ip-detect\n#{ip_config}\nEOF))
+        escaped_ip_config = ip_config.gsub('$', '\$')
+
+        sudo(%(cat << EOF > ~/dcos/genconf/ip-detect\n#{escaped_ip_config}\nEOF))
+      end
+
+      # from https://github.com/mesosphere/dcos-installer/blob/master/dcos_installer/action_lib/__init__.py#L250
+      # TODO: hopefully this goes away at some point so we dont have to write a looping postflight check
+      def write_postflight(machine, postflight_timeout_seconds)
+        postflight = <<-EOF
+#!/usr/bin/env bash
+# Run the DC/OS diagnostic script for up to #{postflight_timeout_seconds} seconds to ensure
+# we do not return ERROR on a cluster that hasn't fully achieved quorum.
+if [[ -e "/opt/mesosphere/bin/3dt" ]]; then
+    # DC/OS >= 1.7
+    CMD="/opt/mesosphere/bin/3dt -diag"
+elif [[ -e "/opt/mesosphere/bin/dcos-diagnostics.py" ]]; then
+    # DC/OS <= 1.6
+    CMD="/opt/mesosphere/bin/dcos-diagnostics.py"
+else
+    echo "Postflight Failure: either 3dt or dcos-diagnostics.py must be present"
+    exit 1
+fi
+T=#{postflight_timeout_seconds}
+until OUT=$(${CMD} 2>&1) || [[ T -eq 0 ]]; do
+    sleep 5
+    let T=T-5
+done
+RETCODE=$?
+if [[ "${RETCODE}" != "0" ]]; then
+    echo "DC/OS Unhealthy\n${OUT}" >&2
+fi
+exit ${RETCODE}
+EOF
+
+        escaped_postflight = postflight.gsub('$', '\$')
+
+        machine.ui.success 'Generating Postflight Script: /opt/mesosphere/bin/postflight.sh'
+        remote_sudo(machine, %(cat << EOF > /opt/mesosphere/bin/postflight.sh\n#{escaped_postflight}\nEOF))
+        remote_sudo(machine, 'chmod u+x /opt/mesosphere/bin/postflight.sh')
       end
 
       def find_address(machine)
@@ -315,7 +259,7 @@ EOF
           end
         end
 
-        raise InstallError.new("Failed to find IP address of machine: #{machine.config.vm.name}")
+        raise AddressResolutionError.new(machine.config.vm.name)
       end
     end
   end

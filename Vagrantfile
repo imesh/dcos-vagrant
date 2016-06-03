@@ -23,7 +23,7 @@ class UserConfig
     c = new
     c.box                  = ENV.fetch('DCOS_BOX', 'mesosphere/dcos-centos-virtualbox')
     c.box_url              = ENV.fetch('DCOS_BOX_URL', 'https://downloads.dcos.io/dcos-vagrant/metadata.json')
-    c.box_version          = ENV.fetch('DCOS_BOX_VERSION', '~> 0.6.0')
+    c.box_version          = ENV.fetch('DCOS_BOX_VERSION', '~> 0.5.0')
     c.machine_config_path  = ENV.fetch('DCOS_MACHINE_CONFIG_PATH', 'VagrantConfig.yaml')
     c.config_path          = ENV.fetch('DCOS_CONFIG_PATH', 'etc/config.yaml')
     c.generate_config_path = ENV.fetch('DCOS_GENERATE_CONFIG_PATH', 'dcos_generate_config.sh')
@@ -75,17 +75,13 @@ class UserConfig
   end
 
   # create environment for provisioning scripts
-  def provision_env(machine_type)
-    env = {
+  def provision_env
+    {
       'DCOS_CONFIG_PATH' => path_to_url(@config_path),
       'DCOS_GENERATE_CONFIG_PATH' => path_to_url(@generate_config_path),
       'DCOS_JAVA_ENABLED' => @java_enabled ? 'true' : 'false',
       'DCOS_PRIVATE_REGISTRY' => @private_registry ? 'true' : 'false'
     }
-    if machine_type['memory-reserved']
-      env['DCOS_TASK_MEMORY'] = machine_type['memory'] - machine_type['memory-reserved']
-    end
-    env
   end
 
   protected
@@ -207,15 +203,33 @@ Vagrant.configure(2) do |config|
       machine.vm.box = machine_type.fetch('box', user_config.box)
       machine.vm.box_url = machine_type.fetch('box-url', user_config.box_url)
       machine.vm.box_version = machine_type.fetch('box-version', user_config.box_version)
+      disk_size = machine_type['size'] || 9
 
       machine.vm.provider 'virtualbox' do |v, override|
         v.name = machine.vm.hostname
         v.cpus = machine_type['cpus'] || 2
         v.memory = machine_type['memory'] || 2048
         v.customize ['modifyvm', :id, '--natdnshostresolver1', 'on']
+        file_to_disk = "./disk-#{machine.vm.hostname}.vdi"
+
+         v.customize [
+             'createhd',
+             '--filename', file_to_disk,
+             '--format', 'VDI',
+             '--size', (disk_size * 1024)
+             ]
+         v.customize [
+             'storageattach', :id,
+             '--storagectl', 'IDE Controller',
+             '--port', 1, '--device', 0,
+             '--type', 'hdd', '--medium',
+             file_to_disk
+         ]
 
         override.vm.network :private_network, ip: machine_type['ip']
       end
+
+      machine.vm.provision "shell", path: "add_new_disk.sh", :args => (disk_size * 1024 - 200) # TODO: fix resizing max val
 
       # provision a shared SSH key (required by DC/OS SSH installer)
       machine.vm.provision(
@@ -230,33 +244,6 @@ Vagrant.configure(2) do |config|
         path: provision_script_path('ca-certificates')
       )
 
-      machine.vm.provision(
-        :shell,
-        name: "Install Probe",
-        path: provision_script_path('install-probe')
-      )
-
-      machine.vm.provision(
-        :shell,
-        name: "Install jq",
-        path: provision_script_path('install-jq')
-      )
-
-      machine.vm.provision(
-        :shell,
-        name: "Install DC/OS Postflight",
-        path: provision_script_path('install-postflight')
-      )
-
-      case machine_type['type']
-      when 'agent-private', 'agent-public'
-        machine.vm.provision(
-          :shell,
-          name: "Install Mesos Memory Modifier",
-          path: provision_script_path('install-mesos-memory')
-        )
-      end
-
       if user_config.private_registry
         machine.vm.provision(
           :shell,
@@ -265,18 +252,15 @@ Vagrant.configure(2) do |config|
         )
       end
 
-      script_path = provision_script_path("type-#{machine_type['type']}")
-      if File.exist?(script_path)
+      # only provision the boot machine
+      if machine_type['type'] == 'boot'
         machine.vm.provision(
           :shell,
           name: "DC/OS #{machine_type['type'].capitalize}",
-          path: script_path,
-          env: user_config.provision_env(machine_type)
+          path: provision_script_path("type-#{machine_type['type']}"),
+          env: user_config.provision_env
         )
-      end
 
-      if machine_type['type'] == 'boot'
-        # install DC/OS after boot machine is provisioned
         machine.vm.provision(
           :dcos_install,
           install_method: user_config.install_method,

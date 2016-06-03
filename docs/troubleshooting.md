@@ -64,7 +64,7 @@ $ vboxmanage hostonlyif ipconfig vboxnet0 --ip 192.168.65.1
 
 **Problem**: One or more Vagrant plugins fail to install.
 
-**Solution**: Upgrade Ruby to >= 2.2. See [Install Ruby](/docs/install-ruby.md) for instructions.
+**Solution**: Upgrade Ruby to >= 2.2. See [Appendix: Install Ruby](#install-ruby) for instructions.
 
 
 ## Package Install Failure
@@ -79,13 +79,3 @@ service dcos-cosmos restart
 ```
 
 This happens because Cosmos doesn't always pick up DNS changes that happen during bootstrap. Known bug in 1.6.1. Should be fixed in 1.7.0.
-
-## Too Many Open Files
-
-**Problem**: `vagrant up` errors with `Too many open files - getcwd (Errno::EMFILE)`
-
-**Solution**: Increase the file limit on the host
-
-```
-ulimit -n 1024
-```
